@@ -6,8 +6,8 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_id": "ee224618-bd59-44d6-9e37-d0f71e46666b",
-			"database_name": "d1-template-database"
+			"database_name": "smelldb",
+			"database_id": "bb5e514a-1573-40d5-ac2e-7c9a0e60e27b"
 		}
 	],
 	"observability": {
