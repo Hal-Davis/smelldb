@@ -1,0 +1,98 @@
+// Simple HTML+JS frontend for batch adding items to cart
+// Place in your public folder or serve statically
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SmellCart Demo Shop</title>
+  <style>
+    body { font-family: sans-serif; margin: 2em; }
+    .product-list { margin-bottom: 2em; }
+    .product { border: 1px solid #ccc; padding: 1em; margin-bottom: 1em; }
+    .cart { margin-top: 2em; }
+    input[type=number] { width: 4em; }
+    button { margin-left: 1em; }
+  </style>
+</head>
+<body>
+  <h1>SmellCart Demo Shop</h1>
+  <div id="products" class="product-list">Loading products...</div>
+  <button id="add-batch">Add Selected to Cart</button>
+  <div class="cart">
+    <h2>Cart</h2>
+    <div id="cart"></div>
+  </div>
+
+<script>
+async function fetchProducts() {
+  const res = await fetch('/api/products');
+  return await res.json();
+}
+
+async function fetchCart() {
+  const res = await fetch('/api/cart');
+  return await res.json();
+}
+
+function renderProducts(products) {
+  const container = document.getElementById('products');
+  container.innerHTML = '';
+  products.forEach(prod => {
+    const div = document.createElement('div');
+    div.className = 'product';
+    div.innerHTML = `
+      <strong>${prod.name}</strong><br>
+      <img src="${prod.main_image || ''}" alt="" style="max-width:100px;max-height:100px"><br>
+      $${prod.price}<br>
+      <label>Qty: <input type="number" min="0" value="0" data-product-id="${prod.id}"></label>
+    `;
+    container.appendChild(div);
+  });
+}
+
+function renderCart(cart) {
+  const container = document.getElementById('cart');
+  if (!cart.length) {
+    container.textContent = 'Cart is empty.';
+    return;
+  }
+  container.innerHTML = '<ul>' + cart.map(item =>
+    `<li>${item.name} x ${item.quantity} ($${item.price})</li>`
+  ).join('') + '</ul>';
+}
+
+async function addBatchToCart(products) {
+  const inputs = document.querySelectorAll('input[type=number][data-product-id]');
+  const batch = [];
+  inputs.forEach(input => {
+    const qty = parseInt(input.value, 10);
+    if (qty > 0) {
+      batch.push({ product_id: parseInt(input.dataset.productId, 10), quantity: qty });
+    }
+  });
+  for (const item of batch) {
+    await fetch('/api/cart/items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(item)
+    });
+  }
+  await loadCart();
+}
+
+async function loadCart() {
+  const cart = await fetchCart();
+  renderCart(cart);
+}
+
+async function main() {
+  const products = await fetchProducts();
+  renderProducts(products);
+  await loadCart();
+  document.getElementById('add-batch').onclick = () => addBatchToCart(products);
+}
+main();
+</script>
+</body>
+</html>

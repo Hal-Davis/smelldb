@@ -1,7 +1,7 @@
 // index.ts — Cloudflare Worker Server Entrypoint
 
 export default {
-    async fetch(request, env) {
+    async fetch(request: Request, env: any) {
         const url = new URL(request.url);
         const path = url.pathname;
         const method = request.method;
@@ -20,6 +20,15 @@ export default {
                 status: 204,
                 headers: corsHeaders
             });
+        }
+
+        // helper: hash passwords using SHA-256
+        async function hashPassword(pwd: string) {
+            const enc = new TextEncoder();
+            const data = enc.encode(pwd);
+            const digest = await crypto.subtle.digest('SHA-256', data);
+            const arr = Array.from(new Uint8Array(digest));
+            return arr.map(b => b.toString(16).padStart(2, '0')).join('');
         }
 
         // ============================================================
@@ -115,6 +124,9 @@ export default {
             }
         }
 
+        // Duplicate login handler removed; using consolidated login later
+
+
         // ============================================================
         // PRODUCT BY SLUG OR ID (SMART RESOLVER)
         // ============================================================
@@ -148,12 +160,21 @@ export default {
                     });
                 }
 
-                // Otherwise treat as slug
-                const slug = value;
+                // Otherwise treat as slug/sku — try to resolve by slug or sku (case-sensitive)
+                const lookupValue = value;
 
+                // Defensive: invalid identifier values (often caused by front-end bugs)
+                if (!lookupValue || lookupValue === 'NaN' || lookupValue.trim() === '') {
+                    return new Response("Invalid product identifier", {
+                        status: 400,
+                        headers: corsHeaders
+                    });
+                }
+
+                // Try to find by slug OR sku in a single query to tolerate different client identifiers
                 const product = await env.DB.prepare(
-                    `SELECT * FROM products WHERE slug = ? AND is_active = 1`
-                ).bind(slug).first();
+                    `SELECT * FROM products WHERE (slug = ? OR sku = ?) AND is_active = 1 LIMIT 1`
+                ).bind(lookupValue, lookupValue).first();
 
                 if (!product) {
                     return new Response("Product not found", {
@@ -179,7 +200,34 @@ export default {
                 });
             }
         }
-
+    // REGISTER: store email and password hash (SHA-256)
+    if (path === "/api/register" && method === "POST") {
+        try {
+            const { email, password } = await request.json();
+            if (!email || !password) {
+                return new Response("Missing email or password", { status: 400, headers: corsHeaders });
+            }
+            // Check if user already exists
+            const existing = await env.DB.prepare(
+                `SELECT id FROM users WHERE email = ?`
+            ).bind(email).first();
+            if (existing) {
+                return new Response(JSON.stringify({ error: "User already exists" }), {
+                    status: 409,
+                    headers: { ...corsHeaders, "Content-Type": "application/json" }
+                });
+            }
+            const hash = await hashPassword(password);
+            await env.DB.prepare(
+                `INSERT INTO users (email, password_hash) VALUES (?, ?)`
+            ).bind(email, hash).run();
+            return new Response(JSON.stringify({ success: true }), {
+                headers: { ...corsHeaders, "Content-Type": "application/json" }
+            });
+        } catch (err) {
+            return new Response("Registration error: " + err, { status: 500, headers: corsHeaders });
+        }
+    }
         // ============================================================
         // CART ENDPOINTS (UNCHANGED)
         // ============================================================
@@ -187,14 +235,18 @@ export default {
         // GET CART
         if (path === "/api/cart" && method === "GET") {
             try {
-                let sessionId = request.headers.get("Cookie")?.match(/session_id=([^;]+)/)?.[1];
-                if (!sessionId) sessionId = crypto.randomUUID();
-
+                let sessionId = request.headers.get("X-Session-Id");
+                if (!sessionId) {
+                    return new Response("Missing X-Session-Id header", {
+                        status: 400,
+                        headers: corsHeaders
+                    });
+                }
                 const { results } = await env.DB.prepare(
                     `SELECT 
                         c.id,
                         c.product_id,
-                        c.quantity,
+                        c.quantity, 
                         p.name,
                         p.price,
                         (
@@ -208,12 +260,10 @@ export default {
                     JOIN products p ON p.id = c.product_id
                     WHERE c.session_id = ?`
                 ).bind(sessionId).all();
-
                 return new Response(JSON.stringify(results), {
                     headers: {
                         ...corsHeaders,
-                        "Content-Type": "application/json",
-                        "Set-Cookie": `session_id=${sessionId}; Path=/; HttpOnly; SameSite=Lax`
+                        "Content-Type": "application/json"
                     }
                 });
             } catch (err) {
@@ -224,11 +274,36 @@ export default {
             }
         }
 
+        // LOGIN: verify password using stored SHA-256 hash
+        if (path === "/api/login" && method === "POST") {
+            try {
+                const { email, password } = await request.json();
+                if (!email || !password) {
+                    return new Response("Missing email or password", { status: 400, headers: corsHeaders });
+                }
+                const user = await env.DB.prepare(
+                    `SELECT * FROM users WHERE email = ?`
+                ).bind(email).first();
+                if (!user) {
+                    return new Response("Invalid credentials", { status: 401, headers: corsHeaders });
+                }
+                const hash = await hashPassword(password);
+                if (user.password_hash !== hash) {
+                    return new Response("Invalid credentials", { status: 401, headers: corsHeaders });
+                }
+                return new Response(JSON.stringify({ success: true }), {
+                    headers: { ...corsHeaders, "Content-Type": "application/json" }
+                });
+            } catch (err) {
+                return new Response("Login error: " + err, { status: 500, headers: corsHeaders });
+            }
+        }
+
         // ADD TO CART
         if (path === "/api/cart/items" && method === "POST") {
             try {
                 const body = await request.json();
-                const { product_id, quantity } = body;
+                const { product_id, quantity, cart_id } = body;
 
                 if (!product_id || !quantity) {
                     return new Response("Missing product_id or quantity", {
@@ -237,35 +312,50 @@ export default {
                     });
                 }
 
-                let sessionId = request.headers.get("Cookie")?.match(/session_id=([^;]+)/)?.[1];
-                if (!sessionId) sessionId = crypto.randomUUID();
+                let sessionId = request.headers.get("X-Session-Id");
+                if (!sessionId) {
+                    return new Response("Missing X-Session-Id header", {
+                        status: 400,
+                        headers: corsHeaders
+                    });
+                }
 
-                const existing = await env.DB.prepare(
-                    `SELECT id, quantity 
-                     FROM cart_items 
-                     WHERE session_id = ? AND product_id = ?`
-                ).bind(sessionId, product_id).first();
+                // Use cart_id if provided, otherwise null
+                const cartIdValue = cart_id ?? null;
+
+                // Check for existing cart item by cart_id (if provided), else by session_id
+                let existing;
+                if (cartIdValue !== null) {
+                    existing = await env.DB.prepare(
+                        `SELECT id, quantity FROM cart_items WHERE cart_id = ? AND product_id = ?`
+                    ).bind(cartIdValue, product_id).first();
+                } else {
+                    existing = await env.DB.prepare(
+                        `SELECT id, quantity FROM cart_items WHERE session_id = ? AND product_id = ?`
+                    ).bind(sessionId, product_id).first();
+                }
 
                 if (existing) {
                     const newQty = existing.quantity + quantity;
-
                     await env.DB.prepare(
-                        `UPDATE cart_items 
-                         SET quantity = ? 
-                         WHERE id = ?`
+                        `UPDATE cart_items SET quantity = ? WHERE id = ?`
                     ).bind(newQty, existing.id).run();
                 } else {
-                    await env.DB.prepare(
-                        `INSERT INTO cart_items (session_id, product_id, quantity)
-                         VALUES (?, ?, ?)`
-                    ).bind(sessionId, product_id, quantity).run();
+                    if (cartIdValue !== null) {
+                        await env.DB.prepare(
+                            `INSERT INTO cart_items (cart_id, session_id, product_id, quantity) VALUES (?, ?, ?, ?)`
+                        ).bind(cartIdValue, sessionId, product_id, quantity).run();
+                    } else {
+                        await env.DB.prepare(
+                            `INSERT INTO cart_items (session_id, product_id, quantity) VALUES (?, ?, ?)`
+                        ).bind(sessionId, product_id, quantity).run();
+                    }
                 }
 
                 return new Response(JSON.stringify({ success: true }), {
                     headers: {
                         ...corsHeaders,
-                        "Content-Type": "application/json",
-                        "Set-Cookie": `session_id=${sessionId}; Path=/; HttpOnly; SameSite=Lax`
+                        "Content-Type": "application/json"
                     }
                 });
             } catch (err) {
@@ -290,9 +380,9 @@ export default {
                     });
                 }
 
-                const sessionId = request.headers.get("Cookie")?.match(/session_id=([^;]+)/)?.[1];
+                const sessionId = request.headers.get("X-Session-Id");
                 if (!sessionId) {
-                    return new Response("No active cart session", {
+                    return new Response("Missing X-Session-Id header", {
                         status: 400,
                         headers: corsHeaders
                     });
@@ -332,9 +422,9 @@ export default {
             try {
                 const cartItemId = path.split("/").pop();
 
-                const sessionId = request.headers.get("Cookie")?.match(/session_id=([^;]+)/)?.[1];
+                const sessionId = request.headers.get("X-Session-Id");
                 if (!sessionId) {
-                    return new Response("No active cart session", {
+                    return new Response("Missing X-Session-Id header", {
                         status: 400,
                         headers: corsHeaders
                     });

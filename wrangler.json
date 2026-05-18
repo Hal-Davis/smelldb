@@ -1,5 +1,9 @@
 {
 	"compatibility_date": "2025-10-08",
+	"dev": {
+    "port": 8787
+},
+
 	"main": "src/index.ts",
 	"name": "smelldb",
 	"upload_source_maps": true,
